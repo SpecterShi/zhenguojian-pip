@@ -1,0 +1,188 @@
+name: Build Windows + macOS
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  GOPROXY: https://proxy.golang.org,direct
+  GOSUMDB: "off"
+
+jobs:
+  build-macos:
+    runs-on: macos-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - edition: hongguojian
+            arguments: ''
+          - edition: zhenguojian
+            arguments: '--all-sources'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: native/go.mod
+          cache-dependency-path: native/go.sum
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.47.4'
+          channel: stable
+          cache: true
+
+      - name: Build macOS universal app (${{ matrix.edition }})
+        id: build
+        continue-on-error: true
+        env:
+          GOSUMDB: "off"
+        run: |
+          set -o pipefail
+          python3 scripts/build_macos.py ${{ matrix.arguments }} 2>&1 | tee build.log
+
+      - name: Save build log (failure)
+        if: always() && steps.build.outcome != 'success'
+        run: |
+          git config user.name "build-bot"
+          git config user.email "build-bot@users.noreply.github.com"
+          git checkout -B "ci-logs-${{ github.run_number }}-${{ matrix.edition }}-macos"
+          cp build.log build-log.txt 2>/dev/null || echo "(no log captured)" > build-log.txt
+          git add -f build-log.txt
+          git commit -m "macOS (${{ matrix.edition }}) build log (run ${{ github.run_number }})" || true
+          git push -f origin "ci-logs-${{ github.run_number }}-${{ matrix.edition }}-macos" || true
+
+      - name: Upload artifact (${{ matrix.edition }})
+        if: steps.build.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.edition }}-macos
+          path: dist/macos/*.zip
+          retention-days: 30
+
+      - name: Fail if ${{ matrix.edition }} macOS build failed
+        if: steps.build.outcome != 'success'
+        run: exit 1
+
+  build-windows:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - edition: hongguojian
+            arguments: ''
+          - edition: zhenguojian
+            arguments: '--all-sources'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: native/go.mod
+          cache-dependency-path: native/go.sum
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.47.4'
+          channel: stable
+          cache: true
+
+      - name: Build Windows package (${{ matrix.edition }})
+        id: build
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -o pipefail
+          # 定位 MinGW-w64 工具链：优先使用镜像自带的 MSYS2，其次常见路径，最后 choco 兜底。
+          if ! command -v x86_64-w64-mingw32-gcc >/dev/null 2>&1; then
+            for d in /c/msys64/mingw64/bin /c/mingw64/bin; do
+              if [ -x "$d/x86_64-w64-mingw32-gcc.exe" ]; then
+                export PATH="$d:$PATH"
+                break
+              fi
+            done
+          fi
+          if ! command -v x86_64-w64-mingw32-gcc >/dev/null 2>&1; then
+            choco install mingw -y --no-progress
+            export PATH="/c/ProgramData/chocolatey/bin:$PATH"
+          fi
+          x86_64-w64-mingw32-gcc --version | head -1
+          python scripts/build_windows.py ${{ matrix.arguments }} 2>&1 | tee build.log
+
+      - name: Save build log (failure)
+        if: always() && steps.build.outcome != 'success'
+        shell: bash
+        run: |
+          git config user.name "build-bot"
+          git config user.email "build-bot@users.noreply.github.com"
+          git checkout -B "ci-logs-${{ github.run_number }}-${{ matrix.edition }}-windows"
+          cp build.log build-log.txt 2>/dev/null || echo "(no log captured)" > build-log.txt
+          git add -f build-log.txt
+          git commit -m "Windows (${{ matrix.edition }}) build log (run ${{ github.run_number }})" || true
+          git push -f origin "ci-logs-${{ github.run_number }}-${{ matrix.edition }}-windows" || true
+
+      - name: Upload artifact (${{ matrix.edition }})
+        if: steps.build.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.edition }}-windows
+          path: dist/windows/*.zip
+          retention-days: 30
+
+      - name: Fail if ${{ matrix.edition }} Windows build failed
+        if: steps.build.outcome != 'success'
+        run: exit 1
+
+  publish:
+    needs: [build-macos, build-windows]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Compose release body
+        run: |
+          VERSION=$(grep '^version:' pubspec.yaml | awk '{print $2}')
+          {
+            echo "## 📝 本版更新（v${VERSION}）"
+            echo ""
+            git log -1 --pretty=%B | sed '/^$/d'
+            echo ""
+            echo "---"
+            echo ""
+            cat .github/RELEASE_TEMPLATE.md
+          } > release-body.md
+          cat release-body.md
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: "真果鉴 / 红果鉴 电脑版构建 #${{ github.run_number }}（Windows + macOS）"
+          body_path: release-body.md
+          files: artifacts/*.zip
